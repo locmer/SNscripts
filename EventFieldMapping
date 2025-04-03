@@ -1,0 +1,40 @@
+/**
+  @Param eventGr - GlideRecord representing the event
+  @Param origEventSysId - Id of the event.
+  The GlideRecord event parameter is a temporary object, and therefore does not contain the id of the original event.
+  @Param ciSysId - The CI SysId.
+  @Param fieldMappingRuleName - The name of this field mapping rule.
+ */
+ (function eventFieldMappingScript(eventGr, origEventSysId, ciSysId, fieldMappingRuleName) {
+  // Make any changes to the alert which will be created out of this Event
+  // Note that the Event itself is immutable, and will not be changed in the database.
+  // You can set the values on the eventGr, e.g. eventGr.setValue(...), but don't perform an update with eventGr.update().
+  // To abort the changes in the event record, return false;
+  // Returning a value other than boolean will result in an error
+  
+  try {
+		var TagName = 'Remco';
+        var addInfo = eventGr.getValue('additional_info');
+        
+        var resObj;
+        if (addInfo) {
+            resObj = JSON.parse(addInfo);
+        } else {
+            resObj = {};
+        }
+     
+        var newObj = {
+            "t_TestTag": TagName
+        };
+        
+        Object.assign(resObj, newObj);
+        var updatedRes = JSON.stringify(resObj);
+        eventGr.setValue('additional_info', updatedRes);
+        
+		gs.info("Remco '" + fieldMappingRuleName + "' .");
+     return true;
+  } catch (e) {
+     gs.error(" The script type mapping rule '" + fieldMappingRuleName + "' ran with the error: \n" + e);
+  }
+
+ })(eventGr, origEventSysId, ciSysId, fieldMappingRuleName);
