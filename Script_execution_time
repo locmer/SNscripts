@@ -1,0 +1,42 @@
+(function() {
+    // Start timing the execution
+    var startTime = new Date().getTime();
+    
+    // Get all Linux CIs from the cmdb_ci_linux_server table
+    var linuxCIs = new GlideRecord('cmdb_ci_linux_server');
+    linuxCIs.orderBy('name');
+    linuxCIs.query();
+    
+    // Output header
+    gs.print('======= LINUX CI LIST =======');
+    gs.print('Name | OS | IP Address | Status');
+    gs.print('-----------------------------');
+    
+    // Counter for number of CIs
+    var count = 0;
+    
+    // List all Linux CIs
+    while (linuxCIs.next()) {
+        // Get the values for each CI
+        var name = linuxCIs.name.toString();
+        var os = linuxCIs.os.toString() || 'Not specified';
+        var ipAddress = linuxCIs.ip_address.toString() || 'No IP';
+        var status = linuxCIs.install_status.toString() || 'Unknown';
+        
+        // Output the CI information
+        gs.print(name + ' | ' + os + ' | ' + ipAddress + ' | ' + status);
+        
+        count++;
+    }
+    
+    // End timing the execution
+    var endTime = new Date().getTime();
+    var executionTime = (endTime - startTime) / 1000;
+    
+    // Output summary
+    gs.print('-----------------------------');
+    gs.print('Total Linux CIs found: ' + count);
+    gs.print('Script execution time: ' + executionTime + ' seconds');
+    gs.print('======= END OF LIST =======');
+    
+})();
