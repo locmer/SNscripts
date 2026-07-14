@@ -1,0 +1,258 @@
+/*----------------------------------------------------*/
+/*                      AUTO                          */
+/*  Update all installed ServiceNow applications      */
+/*----------------------------------------------------*/
+
+(function executeUpdateApps() {
+    var loadDemoData = false;
+    var updateCheck = false;
+
+    /*
+     * Preflight check.
+     *
+     * ServiceNow holds UpdateMutex while an application,
+     * plugin, source-control, or CI/CD operation is running.
+     */
+    if (isUpdateOperationRunning()) {
+        gs.warn(
+            "\n\n------------------------------------------------\n\n" +
+            "APP UPDATE CANCELLED\n\n" +
+            "Another application, plugin, source-control, or CI/CD " +
+            "operation currently holds UpdateMutex.\n\n" +
+            "Wait until the current installation and any pending " +
+            "installations have completed, then run this script again.\n\n" +
+            "------------------------------------------------\n"
+        );
+        return;
+    }
+
+    if (updateCheck) {
+        new sn_appclient.UpdateChecker().checkAvailableUpdates();
+    }
+
+    var previousName = "";
+    var appsArray = [];
+
+    var grSSA = new GlideRecord("sys_store_app");
+    grSSA.addEncodedQuery(
+        "install_dateISNOTEMPTY" +
+        "^hide_on_ui=false" +
+        "^vendor=ServiceNow^ORvendorISEMPTY" +
+        "^latest_version!="
+    );
+    grSSA.orderBy("name");
+    grSSA.orderBy("version");
+    grSSA.query();
+
+    while (grSSA.next()) {
+        var currentName = grSSA.getValue("name");
+
+        if (currentName === previousName) {
+            continue;
+        }
+
+        if (updateAvailable(grSSA)) {
+            previousName = currentName;
+
+            appsArray.push({
+                displayName: currentName,
+                id: grSSA.getUniqueValue(),
+                load_demo_data: loadDemoData,
+                type: "application",
+                requested_version: grSSA.getValue("latest_version")
+            });
+        }
+    }
+
+    if (appsArray.length === 0) {
+        gs.info(
+            "\n\n-----------------------------------------------\n\n" +
+            "All apps appear to be up to date.\n\n" +
+            "If this appears incorrect, run the script again with " +
+            "updateCheck set to true.\n\n" +
+            "-----------------------------------------------\n"
+        );
+        return;
+    }
+
+    gs.info(
+        "\n\n------------------------------------------------\n\n" +
+        "Found " + appsArray.length + " application updates.\n" +
+        "Preparing batch installation...\n\n" +
+        "------------------------------------------------\n"
+    );
+
+    var appsPackages = {
+        name: "Update Apps",
+        packages: appsArray
+    };
+
+    var data = new global.JSON().encode(appsPackages);
+    var baseUrl = gs.getProperty("glide.servlet.uri");
+    var update;
+    var updateObj;
+
+    /*
+     * The preflight check cannot completely prevent a race:
+     * another operation might acquire UpdateMutex after the check.
+     */
+    try {
+        update = new sn_appclient.AppUpgrader().installBatch(data);
+
+        if (!update) {
+            gs.error(
+                "The batch installation was not created. " +
+                "Another update operation may have started after " +
+                "the preflight check. Wait for it to finish and retry."
+            );
+            return;
+        }
+
+        updateObj = JSON.parse(update);
+
+        if (
+            !updateObj ||
+            !updateObj.batch_installation_id ||
+            !updateObj.execution_tracker_id
+        ) {
+            gs.error(
+                "AppUpgrader returned an unexpected response: " + update
+            );
+            return;
+        }
+    } catch (error) {
+        gs.error(
+            "Unable to start the batch installation: " +
+            getErrorMessage(error)
+        );
+        return;
+    }
+
+    gs.info(
+        "\n\n------------------------------------------------\n\n" +
+        "Batch installation successfully created.\n\n" +
+        "Batch install:\n" +
+        baseUrl +
+        "nav_to.do?uri=sys_batch_install_plan.do?sys_id=" +
+        updateObj.batch_installation_id +
+        "\n\nExecution tracker:\n" +
+        baseUrl +
+        "nav_to.do?uri=sys_progress_worker.do?sys_id=" +
+        updateObj.execution_tracker_id +
+        "\n\n------------------------------------------------\n"
+    );
+
+    var grSBIP = new GlideRecord("sys_batch_install_plan");
+
+    if (grSBIP.get(updateObj.batch_installation_id)) {
+        grSBIP.setValue(
+            "notes",
+            "It may take some time for the apps to populate in the " +
+            "related list below. You can refresh the list as needed.\n\n" +
+            "After all apps have populated, installation starts and " +
+            "the state changes to In progress.\n\n" +
+            "When the batch completes, the state changes to Installed."
+        );
+        grSBIP.update();
+    }
+
+    function isUpdateOperationRunning() {
+        var mutex = new GlideRecord("sys_mutex");
+
+        if (!mutex.isValid()) {
+            /*
+             * Do not block execution if the table is unavailable.
+             * installBatch() is still protected by error handling.
+             */
+            gs.warn(
+                "Unable to inspect sys_mutex. Continuing with guarded " +
+                "batch installation."
+            );
+            return false;
+        }
+
+        mutex.addQuery("name", "UpdateMutex");
+        mutex.setLimit(1);
+        mutex.query();
+
+        if (!mutex.next()) {
+            return false;
+        }
+
+        var details = [];
+
+        if (
+            mutex.isValidField("owner") &&
+            mutex.getValue("owner")
+        ) {
+            details.push("owner=" + mutex.getValue("owner"));
+        }
+
+        if (
+            mutex.isValidField("sys_updated_on") &&
+            mutex.getValue("sys_updated_on")
+        ) {
+            details.push(
+                "updated=" + mutex.getDisplayValue("sys_updated_on")
+            );
+        }
+
+        if (details.length > 0) {
+            gs.warn(
+                "Active UpdateMutex detected (" +
+                details.join(", ") +
+                ")."
+            );
+        } else {
+            gs.warn("Active UpdateMutex detected.");
+        }
+
+        return true;
+    }
+
+    function updateAvailable(storeApp) {
+        var installedVersion = storeApp.getValue("version") || "";
+        var latestVersion = storeApp.getValue("latest_version") || "";
+
+        if (!installedVersion || !latestVersion) {
+            return false;
+        }
+
+        var installedParts = installedVersion.split(".");
+        var latestParts = latestVersion.split(".");
+        var length = Math.max(
+            installedParts.length,
+            latestParts.length
+        );
+
+        for (var i = 0; i < length; i++) {
+            var installed = parseInt(installedParts[i] || "0", 10);
+            var latest = parseInt(latestParts[i] || "0", 10);
+
+            installed = isNaN(installed) ? 0 : installed;
+            latest = isNaN(latest) ? 0 : latest;
+
+            if (installed < latest) {
+                return true;
+            }
+
+            if (installed > latest) {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    function getErrorMessage(error) {
+        if (!error) {
+            return "Unknown error";
+        }
+
+        if (error.message) {
+            return error.message;
+        }
+
+        return String(error);
+    }
+})();
