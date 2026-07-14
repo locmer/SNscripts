@@ -1,76 +1,91 @@
 /*----------------------------------------------------*/
 /*                      AUTO                          */
-/*  Update all installed ServiceNow applications      */
+/*                                                    */
+/*  Finds installed ServiceNow applications with      */
+/*  available updates and starts a batch install.     */
+/*                                                    */
+/*  The script exits when another pending or running  */
+/*  platform operation is detected.                   */
 /*----------------------------------------------------*/
 
 (function executeUpdateApps() {
+    // Load demo data with application updates?
     var loadDemoData = false;
+
+    // Checking the Store can take time and produces extensive logging.
     var updateCheck = false;
 
     /*
-     * Preflight check.
-     *
-     * ServiceNow holds UpdateMutex while an application,
-     * plugin, source-control, or CI/CD operation is running.
+     * Stop before building the application list when another operation
+     * is pending or running.
      */
-    if (isUpdateOperationRunning()) {
+    var blockingOperation = findBlockingOperation();
+
+    if (blockingOperation) {
         gs.warn(
             "\n\n------------------------------------------------\n\n" +
             "APP UPDATE CANCELLED\n\n" +
-            "Another application, plugin, source-control, or CI/CD " +
-            "operation currently holds UpdateMutex.\n\n" +
-            "Wait until the current installation and any pending " +
-            "installations have completed, then run this script again.\n\n" +
+            "Another pending or running platform operation was detected.\n\n" +
+            blockingOperation +
+            "\n\nWait until the current installation queue has completed, " +
+            "then run this script again.\n\n" +
             "------------------------------------------------\n"
         );
         return;
     }
 
     if (updateCheck) {
+        gs.info("Checking the ServiceNow Store for available updates...");
         new sn_appclient.UpdateChecker().checkAvailableUpdates();
     }
 
-    var previousName = "";
     var appsArray = [];
+    var processedNames = {};
 
-    var grSSA = new GlideRecord("sys_store_app");
-    grSSA.addEncodedQuery(
+    var storeApp = new GlideRecord("sys_store_app");
+    storeApp.addEncodedQuery(
         "install_dateISNOTEMPTY" +
         "^hide_on_ui=false" +
         "^vendor=ServiceNow^ORvendorISEMPTY" +
         "^latest_version!="
     );
-    grSSA.orderBy("name");
-    grSSA.orderBy("version");
-    grSSA.query();
+    storeApp.orderBy("name");
+    storeApp.orderByDesc("version");
+    storeApp.query();
 
-    while (grSSA.next()) {
-        var currentName = grSSA.getValue("name");
+    while (storeApp.next()) {
+        var applicationName = storeApp.getValue("name");
 
-        if (currentName === previousName) {
+        /*
+         * sys_store_app can contain more than one record with the same
+         * name. Only include each application once.
+         */
+        if (processedNames[applicationName]) {
             continue;
         }
 
-        if (updateAvailable(grSSA)) {
-            previousName = currentName;
+        processedNames[applicationName] = true;
 
-            appsArray.push({
-                displayName: currentName,
-                id: grSSA.getUniqueValue(),
-                load_demo_data: loadDemoData,
-                type: "application",
-                requested_version: grSSA.getValue("latest_version")
-            });
+        if (!updateAvailable(storeApp)) {
+            continue;
         }
+
+        appsArray.push({
+            displayName: applicationName,
+            id: storeApp.getUniqueValue(),
+            load_demo_data: loadDemoData,
+            type: "application",
+            requested_version: storeApp.getValue("latest_version")
+        });
     }
 
     if (appsArray.length === 0) {
         gs.info(
-            "\n\n-----------------------------------------------\n\n" +
-            "All apps appear to be up to date.\n\n" +
+            "\n\n------------------------------------------------\n\n" +
+            "All applications appear to be up to date.\n\n" +
             "If this appears incorrect, run the script again with " +
             "updateCheck set to true.\n\n" +
-            "-----------------------------------------------\n"
+            "------------------------------------------------\n"
         );
         return;
     }
@@ -78,52 +93,84 @@
     gs.info(
         "\n\n------------------------------------------------\n\n" +
         "Found " + appsArray.length + " application updates.\n" +
-        "Preparing batch installation...\n\n" +
+        "Preparing the batch installation...\n\n" +
         "------------------------------------------------\n"
     );
 
-    var appsPackages = {
+    var batchPayload = {
         name: "Update Apps",
         packages: appsArray
     };
 
-    var data = new global.JSON().encode(appsPackages);
+    var data = new global.JSON().encode(batchPayload);
     var baseUrl = gs.getProperty("glide.servlet.uri");
-    var update;
-    var updateObj;
 
     /*
-     * The preflight check cannot completely prevent a race:
-     * another operation might acquire UpdateMutex after the check.
+     * Repeat the preflight check immediately before installBatch().
+     * The first check occurred before constructing the payload.
      */
+    blockingOperation = findBlockingOperation();
+
+    if (blockingOperation) {
+        gs.warn(
+            "\n\n------------------------------------------------\n\n" +
+            "APP UPDATE CANCELLED\n\n" +
+            "Another operation started while the update payload was " +
+            "being prepared.\n\n" +
+            blockingOperation +
+            "\n\nRun this script again after it has completed.\n\n" +
+            "------------------------------------------------\n"
+        );
+        return;
+    }
+
+    var updateResponse;
+    var updateResult;
+
     try {
-        update = new sn_appclient.AppUpgrader().installBatch(data);
+        updateResponse =
+            new sn_appclient.AppUpgrader().installBatch(data);
 
-        if (!update) {
+        /*
+         * AppUpgrader may log its own mutex exception and return null
+         * instead of throwing a catchable JavaScript exception.
+         */
+        if (!updateResponse) {
             gs.error(
-                "The batch installation was not created. " +
-                "Another update operation may have started after " +
-                "the preflight check. Wait for it to finish and retry."
+                "\n\n------------------------------------------------\n\n" +
+                "BATCH INSTALLATION NOT CREATED\n\n" +
+                "AppUpgrader returned no response. Another application, " +
+                "plugin, source-control, or CI/CD operation probably " +
+                "acquired the update lock after the final preflight check.\n\n" +
+                "Wait for that operation to complete and run this script " +
+                "again.\n\n" +
+                "------------------------------------------------\n"
             );
             return;
         }
 
-        updateObj = JSON.parse(update);
-
-        if (
-            !updateObj ||
-            !updateObj.batch_installation_id ||
-            !updateObj.execution_tracker_id
-        ) {
-            gs.error(
-                "AppUpgrader returned an unexpected response: " + update
-            );
-            return;
-        }
+        updateResult = JSON.parse(updateResponse);
     } catch (error) {
         gs.error(
-            "Unable to start the batch installation: " +
-            getErrorMessage(error)
+            "\n\n------------------------------------------------\n\n" +
+            "BATCH INSTALLATION FAILED\n\n" +
+            getErrorMessage(error) +
+            "\n\n------------------------------------------------\n"
+        );
+        return;
+    }
+
+    if (
+        !updateResult ||
+        !updateResult.batch_installation_id ||
+        !updateResult.execution_tracker_id
+    ) {
+        gs.error(
+            "\n\n------------------------------------------------\n\n" +
+            "BATCH INSTALLATION NOT CREATED\n\n" +
+            "AppUpgrader returned an unexpected response:\n" +
+            String(updateResponse) +
+            "\n\n------------------------------------------------\n"
         );
         return;
     }
@@ -131,88 +178,162 @@
     gs.info(
         "\n\n------------------------------------------------\n\n" +
         "Batch installation successfully created.\n\n" +
-        "Batch install:\n" +
+        "It may take some time for all applications to appear in " +
+        "the batch plan.\n\n" +
+        "Batch installation:\n" +
         baseUrl +
         "nav_to.do?uri=sys_batch_install_plan.do?sys_id=" +
-        updateObj.batch_installation_id +
+        updateResult.batch_installation_id +
         "\n\nExecution tracker:\n" +
         baseUrl +
         "nav_to.do?uri=sys_progress_worker.do?sys_id=" +
-        updateObj.execution_tracker_id +
+        updateResult.execution_tracker_id +
         "\n\n------------------------------------------------\n"
     );
 
-    var grSBIP = new GlideRecord("sys_batch_install_plan");
+    var batchPlan = new GlideRecord("sys_batch_install_plan");
 
-    if (grSBIP.get(updateObj.batch_installation_id)) {
-        grSBIP.setValue(
+    if (batchPlan.get(updateResult.batch_installation_id)) {
+        batchPlan.setValue(
             "notes",
-            "It may take some time for the apps to populate in the " +
-            "related list below. You can refresh the list as needed.\n\n" +
-            "After all apps have populated, installation starts and " +
-            "the state changes to In progress.\n\n" +
+            "It may take some time for the applications to populate " +
+            "in the related list below. Refresh the list as needed.\n\n" +
+            "After all applications have populated, installation starts " +
+            "and the state changes to In progress.\n\n" +
             "When the batch completes, the state changes to Installed."
         );
-        grSBIP.update();
+        batchPlan.update();
     }
 
-    function isUpdateOperationRunning() {
+    /**
+     * Looks for a pending/running execution tracker or an update mutex.
+     *
+     * Execution tracker states:
+     *   0 = Pending
+     *   1 = Running
+     *   2 = Successful
+     *   3 = Failed
+     *   4 = Canceled
+     *
+     * @returns {String|null} Description of the blocking operation.
+     */
+    function findBlockingOperation() {
+        var tracker = new GlideRecord("sys_execution_tracker");
+
+        if (
+            tracker.isValid() &&
+            tracker.isValidField("state")
+        ) {
+            tracker.addQuery("state", "IN", "0,1");
+            tracker.orderByDesc("sys_created_on");
+            tracker.setLimit(1);
+            tracker.query();
+
+            if (tracker.next()) {
+                var trackerDetails = [
+                    "Execution tracker: " +
+                        tracker.getUniqueValue(),
+                    "State: " +
+                        tracker.getDisplayValue("state"),
+                    "Created: " +
+                        tracker.getDisplayValue("sys_created_on")
+                ];
+
+                addFieldIfPopulated(
+                    tracker,
+                    trackerDetails,
+                    "name",
+                    "Name"
+                );
+
+                addFieldIfPopulated(
+                    tracker,
+                    trackerDetails,
+                    "message",
+                    "Message"
+                );
+
+                addFieldIfPopulated(
+                    tracker,
+                    trackerDetails,
+                    "source",
+                    "Source"
+                );
+
+                return trackerDetails.join("\n");
+            }
+        }
+
+        /*
+         * Mutex names can contain prefixes or suffixes, so use
+         * CONTAINS rather than requiring an exact name match.
+         */
         var mutex = new GlideRecord("sys_mutex");
 
-        if (!mutex.isValid()) {
-            /*
-             * Do not block execution if the table is unavailable.
-             * installBatch() is still protected by error handling.
-             */
-            gs.warn(
-                "Unable to inspect sys_mutex. Continuing with guarded " +
-                "batch installation."
-            );
-            return false;
+        if (mutex.isValid() && mutex.isValidField("name")) {
+            mutex.addQuery("name", "CONTAINS", "UpdateMutex");
+            mutex.setLimit(1);
+            mutex.query();
+
+            if (mutex.next()) {
+                var mutexDetails = [
+                    "Update mutex: " +
+                        mutex.getDisplayValue("name"),
+                    "Mutex sys_id: " +
+                        mutex.getUniqueValue()
+                ];
+
+                addFieldIfPopulated(
+                    mutex,
+                    mutexDetails,
+                    "owner",
+                    "Owner"
+                );
+
+                addFieldIfPopulated(
+                    mutex,
+                    mutexDetails,
+                    "sys_updated_on",
+                    "Updated"
+                );
+
+                return mutexDetails.join("\n");
+            }
         }
 
-        mutex.addQuery("name", "UpdateMutex");
-        mutex.setLimit(1);
-        mutex.query();
-
-        if (!mutex.next()) {
-            return false;
-        }
-
-        var details = [];
-
-        if (
-            mutex.isValidField("owner") &&
-            mutex.getValue("owner")
-        ) {
-            details.push("owner=" + mutex.getValue("owner"));
-        }
-
-        if (
-            mutex.isValidField("sys_updated_on") &&
-            mutex.getValue("sys_updated_on")
-        ) {
-            details.push(
-                "updated=" + mutex.getDisplayValue("sys_updated_on")
-            );
-        }
-
-        if (details.length > 0) {
-            gs.warn(
-                "Active UpdateMutex detected (" +
-                details.join(", ") +
-                ")."
-            );
-        } else {
-            gs.warn("Active UpdateMutex detected.");
-        }
-
-        return true;
+        return null;
     }
 
-    function updateAvailable(storeApp) {
-        var installedVersion = storeApp.getValue("version") || "";
-        var latestVersion = storeApp.getValue("latest_version") || "";
+    /**
+     * Adds a field's display value to an array when the field exists
+     * and has a value.
+     */
+    function addFieldIfPopulated(
+        record,
+        output,
+        fieldName,
+        label
+    ) {
+        if (!record.isValidField(fieldName)) {
+            return;
+        }
+
+        var value = record.getDisplayValue(fieldName);
+
+        if (value) {
+            output.push(label + ": " + value);
+        }
+    }
+
+    /**
+     * Compares numeric dotted application versions.
+     */
+    function updateAvailable(applicationRecord) {
+        var installedVersion =
+            applicationRecord.getValue("version") || "";
+
+        var latestVersion =
+            applicationRecord.getValue("latest_version") || "";
 
         if (!installedVersion || !latestVersion) {
             return false;
@@ -220,23 +341,36 @@
 
         var installedParts = installedVersion.split(".");
         var latestParts = latestVersion.split(".");
+
         var length = Math.max(
             installedParts.length,
             latestParts.length
         );
 
         for (var i = 0; i < length; i++) {
-            var installed = parseInt(installedParts[i] || "0", 10);
-            var latest = parseInt(latestParts[i] || "0", 10);
+            var installedPart = parseInt(
+                installedParts[i] || "0",
+                10
+            );
 
-            installed = isNaN(installed) ? 0 : installed;
-            latest = isNaN(latest) ? 0 : latest;
+            var latestPart = parseInt(
+                latestParts[i] || "0",
+                10
+            );
 
-            if (installed < latest) {
+            if (isNaN(installedPart)) {
+                installedPart = 0;
+            }
+
+            if (isNaN(latestPart)) {
+                latestPart = 0;
+            }
+
+            if (installedPart < latestPart) {
                 return true;
             }
 
-            if (installed > latest) {
+            if (installedPart > latestPart) {
                 return false;
             }
         }
